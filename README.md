@@ -726,7 +726,7 @@ http://127.0.0.1:7863/panel/
 
 | 视图 | 功能 |
 |---|---|
-| **账号池** | 统计条（账号总数 / 可用 / 冷却中 / 已禁用 / 积分剩余·总额 / 粘性会话）+ 账号表：健康色条与状态标签（可用 / 限流冷却 / 积分冷却 / 熔断 / 连败降权 / 已禁用）、积分量条、成功·失败计数、在途、最近一次用量（次数 / token / 延迟 / 速率）、最近成功时间；单号操作 签到 / 余额 / 任务 / 解冻 / 禁用 / 移除；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」；下方**模型锁池**表列出被上游按模型限流的模型（整池不可用 / 没号可用 / 部分限流）、可选与总数、锁定账号数、最早解锁与全池解锁倒计时、限流原因，无锁定时显示「所有模型均可选」 |
+| **账号池** | 统计条（账号总数 / 可用 / 冷却中 / 已禁用 / 积分剩余·总额 / 粘性会话）+ 账号表：健康色条与状态标签（可用 / 限流冷却 / 积分冷却 / 熔断 / 连败降权 / 已禁用）、积分量条、成功·失败计数、在途、最近一次用量（次数 / token / 延迟 / 速率）、最近成功时间；单号操作 签到 / 余额 / 任务 / 解冻 / 禁用 / 移除；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」；下方**模型可用性**表合并两路数据：近 24 小时有请求的模型（按消耗速率外推的**剩余可用**时间，与「模型」页同口径）与当前被上游按模型限流的模型（整池不可用 / 没号可用 / 部分限流），并列出可选与总数、锁定账号数、最早解锁与全池解锁倒计时、限流原因；续航是估算、倒计时是精确值，两类数字分列不混排。两侧都为空时显示「近 24 小时没有模型请求，也没有模型级限流」 |
 | **用量** | 指标卡（请求数 / 总 token / prompt / completion / 失败尝试 / 平均延迟，含占比与吐字速率）+ **Token 时序图**（渐变堆叠柱、均值参考线、峰值标注、悬停看单桶明细）+ **用量明细**（按账号 / 按模型 / 按域切换，可按合计 Token / 请求数 / 失败数 / 平均延迟排序，含 prompt·completion 占比条）+ **积分扣除历史**（按账号 / 按模型，折算「积分 / 1M Token」） |
 | **积分构成** | **积分到期分布**（按批次到期日聚合，颜色区分账号）+ **账号对比**（按来源归并的面额 / 余额 / 包数卡片与混合构成条）+ 逐包明细（按到期日排序，默认展开最近到期的 `panel.package_detail_limit` 个，其余与已用完的包折叠） |
 | **任务中心** | 成长任务队列：一键扫描全部账号待办 → 按账号排队执行（账号内串行，账号间可选并发 1-3），进度实时更新；另含开学季券码查询。详见 [任务中心](#-任务中心面板新视图) |
@@ -773,7 +773,7 @@ http://127.0.0.1:7863/panel/
 
 | 分组 | 端点 |
 |---|---|
-| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
+| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`）· `GET model_eta`（`hours`，默认 24）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
 | 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
 | 补偿 | `GET compensation`（逐号查补偿状态，**只读**）；`POST accounts/{uid}/compensation`（单号领）；`POST compensation_all`（全量领，返回 `summary{claimed,skipped,errored,credit}`——**先看 `errored` 再看 `claimed`**，否则会把「全部查询失败」说成「没有待领补偿」） |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue` |
@@ -781,6 +781,15 @@ http://127.0.0.1:7863/panel/
 | 写入 | `POST config`（校验 → 落盘 → 热应用，返回需重启字段清单）· `POST usage/save`（立即把内存用量落盘） |
 
 账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。
+
+`GET model_eta` 回答「各模型还能用多久」，**是推算不是配额**：上游没有模型级额度，积分包挂在账号上，模型条目里的 `credits` 只是倍率。所以每行由两条独立数据合成——
+
+- `eta_hours` / `eta_until`：`该域可路由账号余额合计 ÷ 该模型近 N 小时积分消耗速率`，再被积分到期批次钳制（`expiry_capped=true` 表示余额会先过期作废、不是烧完）。样本不足、近期无请求、限免未计费这三种情况分别给 `insufficient` / `idle` / `free`，不外推、不显示无穷大。
+- `locked` / `unlock_at`：上游 6004 的重置墙钟或本地退避截止，**精确值**。整池被限流时状态覆盖为 `locked` 且不输出 `eta_hours`——此刻「还能撑几天」没有意义。
+
+**余额口径兜底**（`state=pool`，`eta_source=balance`）：部分上游版本对所有请求都回 `usage.credit: 0`，此时模型级速率恒为 0，逐模型续航无从计算；但账号余额确实在扣。接口因此读 `credit-history.json`（余额刷新时逐次比对的流水），把窗口内该域账号的净扣减除以窗口长度，得到全池速率再外推。这个数**分不出是哪个模型花的**，前端以「≈」前缀标注为参考值。若窗口内签到/任务补回多于消耗（净增），状态为 `growing` 并给出 `pool_consumed` / `pool_earned` 两侧数字——不会耗尽，但也不是「免费」。
+
+口径限制：余额按域共享，多个模型各自的外推值不可相加，也不代表「只跑这个模型」以外的任何场景。
 
 **安全响应头**：面板页面与全部 `/panel/api/*` 响应统一带 `Content-Security-Policy`（`default-src 'none'`，脚本仅同源，`frame-ancestors 'none'` 禁嵌套）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 等；前端脚本独立为同源 `app.js`，不含内联脚本与内联事件处理器。
 
@@ -894,6 +903,8 @@ http://127.0.0.1:7863/panel/
 | `./credit.sh` / `./credit.sh -json` | 积分日报（美化 / 原始 JSON） |
 | `python3 scripts/probe_active.py` | 活跃上报手动诊断 / 补跑（probe=只读 / report=单号上报 / unlock=单号领猫 / ALL=全池；写操作默认 dry-run，需 `--yes`） |
 | `python3 scripts/probe_max_tokens.py` | 探测各模型**真实输出上限**（区分静默钳制与模型主动收尾），`--panel-out` 结果可直接进面板展示（见下节） |
+| `serve.bat`（Windows） | 静默启动服务：无窗口、日志落 `logs/server.log`；开机自启调的就是它 |
+| `autostart.bat`（Windows） | 开机自启开关：双击出菜单，或 `install` / `uninstall` / `status`（见下节） |
 
 二进制不在 git 中：脚本首次使用自动 `go build` 对应 `cmd/*`（Docker 镜像内已预编译）。
 
@@ -923,6 +934,28 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 `GET /panel/api/model_probes` 只读透传，写入后**下次查询即生效，无需重启网关**；未探测的
 模型不受影响。探测判据（两种停止的区分 / 提示词量级匹配 / 并行与时间预算）的设计细节
 见脚本头部注释。
+
+### Windows 开机自启
+
+双击 `autostart.bat`（或执行 `autostart.bat install`）让服务跟随登录自动启动：
+
+- **实现**：在 `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup` 写一个
+  `workbuddy2api-autostart.vbs`，登录时以隐藏窗口调起 `serve.bat`。用户级、**不需要管理员权限**，
+  卸载就是删这一个文件，不留计划任务、不写注册表。
+- **为什么用 `serve.bat` 而不是 `start.bat`**：`start.bat` 走 `wb2api.bat start`，是 start 一个
+  cmd 窗口去托管 `server.exe`，**窗口一关服务就停**；`serve.bat` 自身就是前台进程、没有窗口，
+  stdout 重定向到 `logs/server.log`（超 10MB 自动轮转一代，留 `server.log.1`）。
+- **单实例**：`serve.bat` 先查 7863 是否已在监听，在跑就直接退出——自启与手动启动不会打架。
+- **日志时间戳**：只写 `%DATE:~0,10%`（`2026/11/10`），因为中文系统的 `%DATE%` 带「星期二」，
+  GBK 字节混进 UTF-8 日志会变成乱码。
+
+```bat
+autostart.bat install     :: 开启（重复执行为覆盖成最新配置）
+autostart.bat uninstall   :: 关闭（正在运行的服务不受影响）
+autostart.bat status      :: 自启项 / 进程 PID / healthz / 日志路径
+```
+
+换二进制（`redeploy.bat`）不影响自启项，重启或重新登录后自然生效。
 
 ### 账号管理
 

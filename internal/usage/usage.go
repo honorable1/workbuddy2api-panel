@@ -149,13 +149,13 @@ type Delta struct {
 	HasCredit        bool
 	ModelRate        string
 	// CacheHitTokens / CacheMissTokens 前缀缓存命中/未命中观测（issue #92）。
-	HasCacheTokens   bool
-	CacheHitTokens   int64
-	CacheMissTokens  int64
-	LatencyMs        int64
-	HasLatency       bool
-	TokensPerSecond  float64
-	HasTPS           bool
+	HasCacheTokens  bool
+	CacheHitTokens  int64
+	CacheMissTokens int64
+	LatencyMs       int64
+	HasLatency      bool
+	TokensPerSecond float64
+	HasTPS          bool
 }
 
 // Add 记录一次请求尝试。
@@ -722,6 +722,143 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 		}
 	}
 	return snap
+}
+
+// ModelBurn 单个 (域, 模型) 在统计窗口内的积分消耗速率，供面板「模型续航」估算。
+//
+// 与 Snapshot.CreditByModel 的关系：同一份桶、同一套窗口口径，区别只在分母——
+// 那边是窗口内的**总量**，这边除以窗口实际时长得到**速率**（积分/小时）。
+// 续航估算唯一需要而现有快照没有的就是这个除法，所以单列一个轻量方法，
+// 不去动 Snapshot 的结构（前端多处按行渲染，加字段要连带改表格）。
+type ModelBurn struct {
+	Realm string `json:"realm"`
+	Model string `json:"model"`
+	// Credits 窗口内该模型累计扣除的积分（只有上游回了 usage.credit 的请求计入）。
+	Credits float64 `json:"credits"`
+	// CreditSamples / Requests / Errors 是估算可信度的分母：失败尝试通常没有
+	// usage，用「成功请求数」而不是总请求数当分母才不会被重试放大误导。
+	CreditSamples int64 `json:"credit_samples"`
+	Requests      int64 `json:"requests"`
+	Errors        int64 `json:"errors"`
+	Tokens        int64 `json:"tokens"`
+	// CreditsPerHour 消耗速率（积分/小时）。Credits 为 0 时恒 0——调用方必须
+	// 用 CreditSamples 与 Requests 区分「没消耗」和「没观测」，不能只看速率。
+	CreditsPerHour float64 `json:"credits_per_hour"`
+}
+
+// BurnRate 汇总窗口内每个 (域, 模型) 的积分消耗速率，同时返回用于折算速率的
+// 实际时长（小时）。
+//
+// 返回的时长与 rates 必须配套使用：调用方拿 pool/rate 得到 ETA 时，若自行按
+// 「请求的 hours」折算，就会与 rate 的分母不一致（窗口起点被整点截断，实际
+// 覆盖时长通常略短于 hours），在小时级窗口下能差出几个百分点。
+//
+// 窗口语义与 SnapshotWindow 完全一致（见 Window.bounds），两者对同一批桶给出
+// 的总量必须相等——否则「用量页说花了 300，续航页说 250」这类口径分叉会再出一次。
+func (r *Recorder) BurnRate(w Window) ([]ModelBurn, float64) {
+	if r == nil {
+		return nil, 0
+	}
+	from, to := w.bounds()
+	windowed := !from.IsZero() || !to.IsZero()
+
+	// 时长分母：显式区间用区间长度；滚动窗口用「窗口起点 → 现在」的真实跨度
+	// （bounds 已把起点对齐到整点）；全部历史用「首条记录 → 现在」。
+	var hours float64
+	now := time.Now()
+	switch {
+	case !from.IsZero():
+		end := now
+		if !to.IsZero() && to.Before(now) {
+			end = to
+		}
+		hours = end.Sub(from).Hours()
+	default:
+		hours = 0 // 无起点（全部历史 / 只给 to）：下面用最早桶的起点补
+	}
+	if hours < 1 {
+		// 窗口短于一小时仍按一小时算：小时桶的粒度决定更短的窗口没有独立样本，
+		// 按真实秒数折算会把「一分钟内的一条记录」放大成 60 倍速率。
+		hours = 1
+	}
+
+	r.mu.Lock()
+	bs := make([]bucket, 0, len(r.buckets))
+	for _, b := range r.buckets {
+		bs = append(bs, *b)
+	}
+	r.mu.Unlock()
+
+	type acc struct {
+		credits float64
+		samples int64
+		req     int64
+		errs    int64
+		tokens  int64
+	}
+	agg := map[string]*acc{}
+	earliest := time.Time{}
+	for i := range bs {
+		b := &bs[i]
+		ts, ok := bucketTime(b.Scope)
+		if !ok {
+			continue
+		}
+		if windowed {
+			if !from.IsZero() && ts.Before(from) {
+				continue
+			}
+			if !to.IsZero() && ts.After(to) {
+				continue
+			}
+		}
+		if earliest.IsZero() || ts.Before(earliest) {
+			earliest = ts
+		}
+		key := b.Realm + "\x1f" + b.Model
+		a := agg[key]
+		if a == nil {
+			a = &acc{}
+			agg[key] = a
+		}
+		a.credits += b.CR
+		a.samples += b.CRN
+		a.req += b.Req
+		a.errs += b.Err
+		a.tokens += b.TT
+	}
+	// 无起点的窗口（全部历史）：用最早桶补出跨度。否则「全部历史」的速率会按
+	// 1 小时折算，得到一个荒谬的巨大值。
+	if from.IsZero() && !earliest.IsZero() {
+		if h := now.Sub(earliest).Hours(); h > hours {
+			hours = h
+		}
+	}
+
+	out := make([]ModelBurn, 0, len(agg))
+	for key, a := range agg {
+		sep := strings.IndexByte(key, '\x1f')
+		row := ModelBurn{
+			Realm:         key[:sep],
+			Model:         key[sep+1:],
+			Credits:       a.credits,
+			CreditSamples: a.samples,
+			Requests:      a.req,
+			Errors:        a.errs,
+			Tokens:        a.tokens,
+		}
+		if hours > 0 {
+			row.CreditsPerHour = a.credits / hours
+		}
+		out = append(out, row)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Realm != out[j].Realm {
+			return out[i].Realm < out[j].Realm
+		}
+		return out[i].Model < out[j].Model
+	})
+	return out, hours
 }
 
 func canonicalUsageModel(model string) string {

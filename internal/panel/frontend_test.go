@@ -2,6 +2,7 @@ package panel
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -500,6 +501,104 @@ process.stdout.write(JSON.stringify({
 	const want = `{"cn":null,"unknown":"unknown","denied":"denied","missing":"missing","partial":"partial","starved":"starved","rate":"rate","upstream":"upstream","ok":"ok","deniedTag":true}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("model availability=%s want %s", out, want)
+	}
+}
+
+// TestAppJSModelEta 钉住模型表「剩余可用」列的渲染口径：
+//   - 限流中只给倒计时，绝不与续航数字混排（一个是上游给的，一个是外推的）；
+//   - 免费/无样本/余额耗尽各自有明确文案，不能退化成「—」被读成「没有数据」；
+//   - 续航按时长量级切单位（72 时 → 3 天），否则「1440 时」无法阅读。
+func TestAppJSModelEta(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; model eta test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function fmtEta');
+const end = src.indexOf('function mdRowHtml');
+if (start < 0 || end < 0) throw new Error('eta helpers not found');
+const ctx = {
+  esc: s => String(s),
+  parseAPITime: v => { const ms = Date.parse(String(v || '')); return Number.isFinite(ms) ? ms : 0; },
+  dur: s => s + 's',
+  Date,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.etaCell=etaCell; this.fmtEta=fmtEta;', ctx);
+ctx.mdEtaHours = 24;
+ctx.mdEta = {
+  'cn:locked-model': { realm: 'cn', model: 'locked-model', state: 'locked', unlock_at: new Date(Date.now()+600000).toISOString() },
+  'cn:free-model': { realm: 'cn', model: 'free-model', state: 'free' },
+  'cn:thin': { realm: 'cn', model: 'thin', state: 'insufficient', credit_samples: 1, requests: 40 },
+  'cn:ok': { realm: 'cn', model: 'ok', state: 'ok', eta_hours: 72, burn_per_hour: 2.5, pool_credits: 180 },
+  'cn:capped': { realm: 'cn', model: 'capped', state: 'ok', eta_hours: 10, burn_per_hour: 1, pool_credits: 100, expiry_capped: true },
+  'cn:empty': { realm: 'cn', model: 'empty', state: 'empty' },
+  'cn:idle': { realm: 'cn', model: 'idle', state: 'idle' },
+};
+const cell = id => ctx.etaCell({ id });
+process.stdout.write(JSON.stringify({
+  missing: cell('cn:none'),
+  locked: cell('cn:locked-model'),
+  free: cell('cn:free-model'),
+  thin: cell('cn:thin'),
+  ok: cell('cn:ok'),
+  capped: cell('cn:capped'),
+  empty: cell('cn:empty'),
+  idle: cell('cn:idle'),
+  fmt: [ctx.fmtEta(0.5), ctx.fmtEta(72), ctx.fmtEta(9000)],
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "model-eta-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("model eta node test failed: %v\n%s", err, out)
+	}
+	var got struct {
+		Missing, Locked, Free, Thin, Ok, Capped, Empty, Idle string
+		Fmt                                                  []string
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("decode node output %q: %v", out, err)
+	}
+	if !strings.Contains(got.Missing, "—") {
+		t.Errorf("无数据应为破折号: %s", got.Missing)
+	}
+	if !strings.Contains(got.Locked, "限流") || !strings.Contains(got.Locked, "tag bad") {
+		t.Errorf("限流行应给倒计时标签: %s", got.Locked)
+	}
+	if strings.Contains(got.Locked, "天") && !strings.Contains(got.Locked, "限流") {
+		t.Errorf("限流行不得显示续航天数: %s", got.Locked)
+	}
+	if !strings.Contains(got.Free, "免费中") {
+		t.Errorf("免费行: %s", got.Free)
+	}
+	if !strings.Contains(got.Thin, "样本不足") {
+		t.Errorf("样本不足行: %s", got.Thin)
+	}
+	if !strings.Contains(got.Ok, "3 天") {
+		t.Errorf("72 小时应显示 3 天: %s", got.Ok)
+	}
+	if !strings.Contains(got.Capped, "var(--warn)") {
+		t.Errorf("到期钳制的行要标警示色: %s", got.Capped)
+	}
+	if !strings.Contains(got.Empty, "余额耗尽") {
+		t.Errorf("余额耗尽行: %s", got.Empty)
+	}
+	// idle 行来自模型目录（窗口内没请求），说「无请求」比破折号更能解释「为什么没数字」。
+	// 完全没有这一行（连目录都没有）时走 etaCellNone，那才是破折号。
+	if !strings.Contains(got.Idle, "无请求") {
+		t.Errorf("idle 应显式写「无请求」: %s", got.Idle)
+	}
+	if len(got.Fmt) != 3 || got.Fmt[0] != "30 分" || got.Fmt[1] != "3 天" || got.Fmt[2] != "> 1 年" {
+		t.Errorf("fmtEta 量级切换: %v want [30 分 3 天 > 1 年]", got.Fmt)
 	}
 }
 
@@ -1519,3 +1618,177 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
+// TestAppJSAvailabilityTable 钉住首页「模型可用性」表的渲染口径：
+//   - model_eta 的 rows 已被后端并成「有用量 ∪ 有锁」，前端必须优先用它，
+//     否则加上的续航列对纯锁池数据永远是空的；
+//   - 没有模型级限流的行 total=0，不能渲染成「0 / 0」——那会被读成池子是空的；
+//   - 有锁定但仍有号能服务的是「部分限流」，不能报成「整池不可用」；
+//   - 表头 9 列，任一分支的 colspan 必须跟着走。
+func TestAppJSAvailabilityTable(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; availability table test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+function cut(from, to) {
+  const a = src.indexOf(from), b = src.indexOf(to);
+  if (a < 0 || b < 0 || b <= a) throw new Error('slice failed: ' + from + ' -> ' + to);
+  return src.slice(a, b);
+}
+const code = cut('function renderAvailability', 'async function loadOverview') +
+             cut('function fmtEta', 'function mdRowHtml');
+const sinks = {};
+const mk = id => (sinks[id] = { innerHTML: '', textContent: '' });
+const ctx = {
+  esc: s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;'),
+  parseAPITime: v => { const t = String(v || ''); if (!t || t.startsWith('0001-')) return 0;
+    const ms = Date.parse(t); return Number.isFinite(ms) ? ms : 0; },
+  dur: s => s + 's',
+  Date, Math, Number, String,
+  mdEtaHours: 24, mdEta: {}, mdEtaBalance: null,
+  $: id => sinks[id] || mk(id),
+};
+vm.createContext(ctx);
+vm.runInContext(code + '\nthis.renderAvailability = renderAvailability;', ctx);
+
+const cells = html => (html.match(/<td/g) || []).length;
+const trs = html => (html.match(/<tr>/g) || []).length;
+
+// 1) eta 并集优先于 overview 的纯锁池
+ctx.renderAvailability([{ model: 'should-be-ignored', realm: 'cn', state: 'locked' }], [
+  { model: 'glm-5.2', realm: 'cn', state: 'ok', eta_hours: 72, burn_per_hour: 2.5, pool_credits: 180, total: 3, servable: 2, locked: 1 },
+  { model: 'claude-4.6', realm: 'global', state: 'locked', locked: 2, total: 2, servable: 0, unlock_at: '2099-01-01T00:00:00Z', reason: '6004 upstream' },
+  { model: 'no-lock', realm: 'cn', state: 'free' },
+]);
+const merged = sinks['mlBody'].innerHTML;
+const mergedNote = sinks['mlNote'].textContent;
+
+// 2) eta 拉不到：退回 model_locks，partial 行仍要认成「部分限流」
+ctx.renderAvailability([{ model: 'x', realm: 'cn', state: 'partial', locked: 1, total: 3, servable: 2 }], null);
+const fallback = sinks['mlBody'].innerHTML;
+
+// 3) 两侧都空
+ctx.renderAvailability(null, null);
+const empty = sinks['mlBody'].innerHTML;
+
+// 4) 余额口径（state=pool）：上游不回模型级扣费时的降级值，必须带「≈」，
+//    且表头要把全池消耗/余额/续航写清楚，否则一行行相同的数字会被当成按模型算的。
+ctx.mdEtaBalance = { pool_credits: 9150, consumed: 21, earned: 0, eta_hours: 10457 };
+ctx.renderAvailability(null, [
+  { model: 'glm-5.2', realm: 'cn', state: 'pool', eta_hours: 10457, eta_source: 'balance', pool_burn_per_hour: 0.875, pool_consumed: 21, pool_credits: 9150 },
+]);
+const poolRow = sinks['mlBody'].innerHTML;
+const poolNote = sinks['mlNote'].textContent;
+
+// 5) 目录行（state=idle）：窗口内没请求。必须说「无请求」而不是留白——
+//    留白正是「模型可用性没有数据」的来源；同时表头不能把 idle 算成「有观测」。
+ctx.mdEtaBalance = { pool_credits: 900, consumed: 0, earned: 0 };
+ctx.renderAvailability(null, [
+  { model: 'glm-5.2', realm: 'cn', state: 'idle', pool_credits: 900, credit_rate: '0.79' },
+]);
+const idleRow = sinks['mlBody'].innerHTML;
+const idleNote = sinks['mlNote'].textContent;
+
+process.stdout.write(JSON.stringify({
+  mergedRows: trs(merged), mergedCells: cells(merged),
+  ignoredOld: merged.indexOf('should-be-ignored') >= 0,
+  partial: merged.indexOf('部分限流') >= 0,
+  locked: merged.indexOf('整池不可用') >= 0,
+  etaDays: merged.indexOf('3 天') >= 0,
+  noZeroPair: merged.indexOf('0 / 0') < 0,
+  note: mergedNote,
+  fallbackRows: trs(fallback), fallbackCells: cells(fallback),
+  fallbackPartial: fallback.indexOf('部分限流') >= 0,
+  emptyColspan: empty.indexOf('colspan="9"') >= 0,
+  poolApprox: poolRow.indexOf('≈ ') >= 0,
+  poolNotFree: poolRow.indexOf('免费中') < 0,
+  poolNote: poolNote,
+  idleNoRequest: idleRow.indexOf('无请求') >= 0,
+  idleNote: idleNote,
+  idleRate: idleRow.indexOf('0.79') >= 0,
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "availtable-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("availability table node test failed: %v\n%s", err, out)
+	}
+	var got struct {
+		MergedRows, MergedCells int
+		IgnoredOld              bool
+		Partial, Locked         bool
+		EtaDays                 bool
+		NoZeroPair              bool
+		Note                    string
+		FallbackRows            int
+		FallbackCells           int
+		FallbackPartial         bool
+		EmptyColspan            bool
+		PoolApprox              bool
+		PoolNotFree             bool
+		PoolNote                string
+		IdleNoRequest           bool
+		IdleNote                string
+		IdleRate                bool
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("decode node output %q: %v", out, err)
+	}
+	if got.IgnoredOld {
+		t.Error("有 model_eta 时不应再渲染 overview 的 model_locks")
+	}
+	if got.MergedRows != 3 || got.FallbackRows != 1 {
+		t.Errorf("rows merged=%d fallback=%d, want 3 / 1", got.MergedRows, got.FallbackRows)
+	}
+	if got.MergedCells != 3*9 || got.FallbackCells != 9 {
+		t.Errorf("cells merged=%d fallback=%d, want %d / 9（表头为 9 列）",
+			got.MergedCells, got.FallbackCells, 3*9)
+	}
+	if !got.Partial || !got.Locked {
+		t.Errorf("状态标签缺失：partial=%v locked=%v", got.Partial, got.Locked)
+	}
+	if !got.EtaDays {
+		t.Error("72 小时应渲染为「3 天」")
+	}
+	if !got.NoZeroPair {
+		t.Error("无模型级限流的行不应渲染成 0 / 0")
+	}
+	if !strings.Contains(got.Note, "1 个整池不可用") || !strings.Contains(got.Note, "1 个部分限流") {
+		t.Errorf("note=%q，应同时统计整池不可用与部分限流", got.Note)
+	}
+	if !got.FallbackPartial {
+		t.Error("退回 model_locks 时 state=partial 应渲染为「部分限流」")
+	}
+	if !got.EmptyColspan {
+		t.Error("空态 colspan 必须为 9")
+	}
+	// 余额口径是参考值，必须显式区分：带「≈」、且不能渲染成「免费中」。
+	if !got.PoolApprox {
+		t.Error("state=pool 的续航必须带「≈」前缀（参考值，非模型级配额）")
+	}
+	if !got.PoolNotFree {
+		t.Error("state=pool 不能渲染成「免费中」——余额在扣就说明在花钱")
+	}
+	if !strings.Contains(got.PoolNote, "余额 9150") || !strings.Contains(got.PoolNote, "扣 21") {
+		t.Errorf("poolNote=%q，表头应给出全池余额与窗口内消耗", got.PoolNote)
+	}
+	// 目录行：有模型名但没有用量时，必须明说「无请求」，否则整行留白会被读成没数据。
+	if !got.IdleNoRequest {
+		t.Error("state=idle 必须渲染「无请求」，不能留空或只给「—」")
+	}
+	if !got.IdleRate {
+		t.Error("目录行的倍率应出现在提示文案里（这说明该行确实来自目录）")
+	}
+	if !strings.Contains(got.IdleNote, "0 / 1 个模型有观测") {
+		t.Errorf("idleNote=%q，目录行不能计入「有观测」", got.IdleNote)
+	}
+}

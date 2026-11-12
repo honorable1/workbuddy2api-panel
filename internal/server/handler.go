@@ -115,6 +115,13 @@ const notFoundCooldown = 60 * time.Second
 // 返回 2xx 也不带本标识，宿主据此可识别"假成功"。
 const ServiceName = "workbuddy2api"
 
+// chatBodyLimit chat 请求体上限。issue #100 移除旧的 max_body_mb（过小会掐断大上下文
+// 慢上传）后，chat 路径一度完全不设限：ReadTimeout 只限时间（默认 300s），单连接仍可
+// 在这段时间内持续推送，io.ReadAll 反复扩容（峰值约 2×body），几个并发即可打爆内存。
+// 取 256MiB——足够覆盖 1M context + base64 图片的极端请求，又给内存设了硬边界；
+// 超限回 413 且不罚号（同一 body 换任何账号都会超限）。
+const chatBodyLimit = 256 << 20
+
 // Handler 主路由。
 type Handler struct {
 	cfg     Config
@@ -555,13 +562,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
 	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
 	clientIP := upstream.ExtractClientIP(r)
-	// 请求体无大小上限（max_body_mb 已移除，对齐上游）：完整读入，超限类问题交由
-	// 上游自然返回错误（其响应经既有错误分类链路透出，信息量更大）。#41 的截断
-	// 防御语义保留在读错误路径——移除预拦截后，截断只可能来自客户端自己断流，
-	// 读 body 出错就地 400，不把半截 JSON 喂上游 unmarshal 报 unexpected EOF 冤枉罚号。
-	body, err := io.ReadAll(r.Body)
+	// 请求体带上限读入：ReadTimeout 只约束时间不约束体积，无 LimitReader 时慢速
+	// 大 body 可把进程内存打爆（详见 chatBodyLimit 注释）。多读 1 字节用于精确判定
+	// 「恰好等于上限」与「超限」。超限就地 413，不进入选号/上游链路——不占名额、
+	// 不罚号，且请求日志（ServeHTTP 层）仍会记下这条 413。
+	body, err := io.ReadAll(io.LimitReader(r.Body, chatBodyLimit+1))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+		return
+	}
+	if len(body) > chatBodyLimit {
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+			fmt.Sprintf("request body exceeds gateway limit of %d bytes", int64(chatBodyLimit)))
 		return
 	}
 	var peek struct {

@@ -50,6 +50,11 @@ func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Referrer-Policy", "no-referrer")    // 不外泄面板地址给外部站点
 	w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
 	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+	// 禁止任何缓存：/panel/api/* 返回账号 UID/昵称/积分/配置（含 upstash.token），
+	// 共享机器上被浏览器磁盘缓存等于把管理数据留在本地；静态资源同样 no-store，
+	// 顺带避免升级二进制后旧 app.js 命中缓存、去调用已变更的 API。
+	w.Header().Set("Cache-Control", "no-store, max-age=0")
+	w.Header().Set("Pragma", "no-cache") // HTTP/1.0 代理兜底
 }
 
 // index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。

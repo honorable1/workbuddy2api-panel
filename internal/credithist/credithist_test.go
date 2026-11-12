@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 // 首次见到账号只建基线：把历史余额误报成「刚获得」是最刺眼的错误，
@@ -177,5 +178,44 @@ func TestConcurrentObserve(t *testing.T) {
 		if v := l2.snapshot[fmt.Sprintf("u%d", i)]; v != 300 {
 			t.Fatalf("u%d 快照应为 300，得到 %d", i, v)
 		}
+	}
+}
+
+// TestStatsSinceBy 汇总窗口内的增减。净消耗要用 Consumed-Earned：签到补额度
+// 会抵消消耗，只看负 delta 会把「越用越多」误报成「在烧钱」。
+func TestStatsSinceBy(t *testing.T) {
+	l := New("", 100)
+	l.Observe("u1", 1000)
+	l.Observe("u1", 940)  // -60 消耗
+	l.Observe("u1", 1000) // +60 签到
+	l.Observe("u2", 500)
+	l.Observe("u2", 470) // -30 消耗
+
+	st := l.StatsSince(time.Time{})
+	if st.Consumed != 90 || st.Earned != 60 || st.Count != 3 {
+		t.Fatalf("stats=%+v, want consumed=90 earned=60 count=3", st)
+	}
+	if st.Earliest.IsZero() {
+		t.Fatal("Earliest 应有值")
+	}
+
+	// 按 uid 过滤：只算 u2 的 -30。
+	only2 := l.StatsSinceBy(time.Time{}, func(uid string) bool { return uid == "u2" })
+	if only2.Consumed != 30 || only2.Earned != 0 || only2.Count != 1 {
+		t.Fatalf("filtered=%+v, want consumed=30 count=1", only2)
+	}
+
+	// 未来时间点：窗口内没有任何变动，Count=0 用来区分「没有观测」与「消耗为 0」。
+	if future := l.StatsSince(time.Now().Add(time.Hour)); future.Count != 0 {
+		t.Fatalf("未来窗口不该有变动，得到 %+v", future)
+	}
+}
+
+// TestStatsSinceNilLedger 未装配账本时返回零值而不是 panic：面板在纯本地模式下
+// 没有流水，接口必须照常可用。
+func TestStatsSinceNilLedger(t *testing.T) {
+	var l *Ledger
+	if st := l.StatsSince(time.Time{}); st.Count != 0 {
+		t.Fatalf("nil ledger stats=%+v, want 零值", st)
 	}
 }

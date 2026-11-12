@@ -171,8 +171,15 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	_, epToken, epAcct, origin := loginEndpoints(sess.realm)
 
 	// auth/token 是权威登录状态端点：pending 时业务 code 非 0（"login ing"）。
-	tokRaw, _, err := doJSON(http.MethodGet, epToken+state, "", nil, origin)
+	tokRaw, tokenStatus, err := doJSON(http.MethodGet, epToken+state, "", nil, origin)
 	if err != nil {
+		// 上游故障（传输层错误 status=0、或 5xx）不是「登录中」：伪装成 pending 会让
+		// 前端无限轮询、用户永远看不到真实原因。只有业务态 pending（上游 2xx/4xx +
+		// code != 0，如 "login ing"）才继续轮询。
+		if tokenStatus == 0 || tokenStatus >= 500 {
+			writeErr(w, http.StatusBadGateway, fmt.Sprintf("login state check failed (upstream %d): %v", tokenStatus, err))
+			return
+		}
 		// pending / 未完成：面板前端继续轮询。
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": err.Error()})
 		return

@@ -1827,6 +1827,32 @@ func (c *Client) ModelRate(realm, model string) string {
 	return c.modelRates[realmKey(realm)][model]
 }
 
+// RatesSnapshot 返回最近一次目录刷新得到的整张倍率表副本（模型 id → 倍率原文）。
+// 该域从未刷新成功过时返回 nil。
+//
+// 用途：面板「模型可用性」需要一个「已知有哪些模型」的列表，而目录本身只在上游
+// 请求成功后才填。全量 FetchModels 要几秒且打上游，不适合被轮询的接口调用；
+// 读这张内存表是零成本的，代价是它只覆盖「预热过 / 打开过模型页」之后的模型。
+//
+// 返回副本：调用方拿到后会在自己的 goroutine 里遍历，直接暴露内部 map 会与
+// storeModelRates 的整体替换（并发写 map）撞出 fatal error。
+func (c *Client) RatesSnapshot(realm string) map[string]string {
+	if c == nil {
+		return nil
+	}
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+	src := c.modelRates[realmKey(realm)]
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
 // GlobalEffortSnapshot 导出 global 域 effort 能力缓存（探测下发 ∪ 静态兜底合并后的桶），
 // 供 /v1/models 输出 reasoning_supported_efforts / reasoning_default_effort。
 // 返回副本；桶未填充（无 global 账号或从未探测）→ nil（调用方回落静态兜底表）。

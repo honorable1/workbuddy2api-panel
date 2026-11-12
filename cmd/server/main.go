@@ -59,7 +59,7 @@ func main() {
 			// 首次运行：目录下没有配置 → 自动落一份推荐配置（含随机 api_key）再加载。
 			// 双击 exe / 裸跑 docker 即开，无需先手工复制样例。
 			if key, werr := WriteDefault(*cfgPath); werr == nil {
-				log.Printf("config %s 不存在，已生成推荐配置（api_key=%s，记录在该文件里，可自行修改）", *cfgPath, key)
+				log.Printf("config %s 不存在，已生成推荐配置（api_key=%s…，完整值见该文件，可自行修改）", *cfgPath, maskKey(key))
 				cfg, err = Load(*cfgPath)
 			}
 			if err != nil {
@@ -70,6 +70,16 @@ func main() {
 		}
 		if err != nil {
 			log.Fatalf("load config: %v", err)
+		}
+	}
+
+	// 暴露面自检：非回环监听 + 弱密钥 = 致命（同网段可白嫖网关/接管面板），拒绝启动；
+	// 回环 + 弱密钥 = 告警（本机安全，提醒设强密钥）。
+	if warns, fatal := cfg.SecurityCheck(); fatal != nil {
+		log.Fatalf("config security: %v", fatal)
+	} else {
+		for _, w := range warns {
+			log.Printf("[SECURITY] WARN: %s", w)
 		}
 	}
 
@@ -446,6 +456,15 @@ func panelListenPath(listen string) string {
 	return listen
 }
 
+// maskKey 日志脱敏：只露前 8 位。自动生成的 api_key 会进容器 / CI 日志，
+// 明文留存等于把密钥抄进另一份没人管理的存储里。过短则整体隐去。
+func maskKey(k string) string {
+	if len(k) <= 8 {
+		return "***"
+	}
+	return k[:8]
+}
+
 // saveConfig 面板保存配置：校验 → 落盘 → 热应用 → 返回需重启的字段列表。
 //
 // 热生效范围（设计取舍）：
@@ -478,6 +497,10 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	newCfg, err := ParseConfig(mergedJSON(merged))
 	if err != nil {
 		return nil, err
+	}
+	// 2.5) 暴露面自检：非回环 + 弱密钥 = 拒绝对外暴露（返回错误、不落盘）。
+	if _, fatal := newCfg.SecurityCheck(); fatal != nil {
+		return nil, fatal
 	}
 
 	// 3) 落盘（原子替换）。

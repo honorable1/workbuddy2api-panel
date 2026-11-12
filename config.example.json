@@ -1,6 +1,7 @@
 {
-  "listen": ":7863",
-  "api_key": "test_key",
+  "listen": "127.0.0.1:7863",
+  "_comment_api_key": "必填强密钥！留空=不鉴权（仅本机回环安全）；勿用 test_key 等公开占位符——公网/局域网暴露时网关与面板即被接管",
+  "api_key": "",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "dns_servers": [],

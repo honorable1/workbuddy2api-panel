@@ -341,7 +341,13 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 			if accepted := p.acceptPendingTasks(one.a); accepted > 0 {
 				time.Sleep(reportGap) // 给上游状态流转留时间
 			}
-			for i := range q.items {
+			// 条目数在锁内取一次：running 期间 q.items 不会被替换（startGrowthQueue 有
+			// running 闸），但显式加锁读长度，避免依赖该不变量去无锁读 slice header
+			// （将来若放宽 running 判别，这里会直接变成 data race）。
+			q.mu.Lock()
+			itemCount := len(q.items)
+			q.mu.Unlock()
+			for i := 0; i < itemCount; i++ {
 				uid, kind, code := q.snapshotAt(i)
 				if uid != one.a.UID {
 					continue

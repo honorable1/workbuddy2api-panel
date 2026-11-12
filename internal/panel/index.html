@@ -702,6 +702,26 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="pad"><div id="compList"></div></div>
       </div>
 
+      <!-- 模型可用性：放在账号池表之前。它只有几行、信息密度低，而账号表很长——
+           放在账号表下方时实际没人会滚到，等于没做。 -->
+      <div class="box">
+        <header>
+          <h3>模型可用性 <span class="hint">还能用多久、限流何时恢复</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="mlNote"></span>
+        </header>
+        <div class="tbl-wrap">
+        <table class="acc">
+          <thead><tr>
+            <th>模型</th><th>域</th><th>状态</th>
+            <th title="按近 24 小时该模型的消耗速率外推剩余积分能撑多久（估算）；限流中的模型显示恢复倒计时（精确）。与「模型」页同口径">剩余可用</th>
+            <th>可选 / 总数</th><th>锁定账号</th><th>最早解锁</th><th>全池解锁</th><th>原因</th>
+          </tr></thead>
+          <tbody id="mlBody"></tbody>
+        </table>
+        </div>
+      </div>
+
       <div class="box">
         <header>
           <h3>账号池</h3>
@@ -725,22 +745,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
       </div>
 
-      <div class="box">
-        <header>
-          <h3>模型锁池 <span class="hint">哪些模型不能用、还要锁多久</span></h3>
-          <span class="grow"></span>
-          <span class="note" id="mlNote"></span>
-        </header>
-        <div class="tbl-wrap">
-        <table class="acc">
-          <thead><tr>
-            <th>模型</th><th>域</th><th>状态</th><th>可选 / 总数</th>
-            <th>锁定账号</th><th>最早解锁</th><th>全池解锁</th><th>原因</th>
-          </tr></thead>
-          <tbody id="mlBody"></tbody>
-        </table>
-        </div>
-      </div>
     </section>
 
     <!-- 任务中心 -->
@@ -825,7 +829,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
         <div class="tbl-wrap">
         <table class="acc md">
-          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th></tr></thead>
+          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th><th title="按近 24 小时该模型的消耗速率外推剩余积分能撑多久（估算）；限流中的模型显示恢复倒计时（精确）">剩余可用</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th></tr></thead>
           <tbody id="mdBody"></tbody>
         </table>
         </div>

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,7 +12,7 @@ import (
 
 func TestDefault(t *testing.T) {
 	c := Default()
-	if c.Listen != ":7863" {
+	if c.Listen != "127.0.0.1:7863" {
 		t.Errorf("listen=%s", c.Listen)
 	}
 	if err := c.normalize(); err != nil {
@@ -19,6 +20,68 @@ func TestDefault(t *testing.T) {
 	}
 	if c.SoftRateDur.Seconds() != 600 {
 		t.Errorf("soft=%v want 600s", c.SoftRateDur)
+	}
+}
+
+// TestIsWeakKey 锁定「过短即弱密钥」的判定边界：SecurityCheck 只经此函数判弱，
+// 阈值一旦放宽，"123456" / "admin" 这类占位符就会在非回环监听下被放行。
+// 下限 16 的选择理由见 isWeakKey 注释（保护 27 字符的存量自动配置）。
+func TestIsWeakKey(t *testing.T) {
+	weak := []string{
+		"",               // 未设置
+		"test_key",       // 历史示例
+		"changeme",       // 常见 placeholder
+		"example-please", // example 前缀
+		"sk-short",       // 过短
+		"123456",
+		"admin",
+	}
+	for _, k := range weak {
+		if !isWeakKey(k) {
+			t.Errorf("isWeakKey(%q)=false, want true", k)
+		}
+	}
+	strong := []string{
+		"0123456789abcdef", // 恰好 16 字符 = 下限内
+		"sk-0123456789abcdefghijklmnopqrstuvwxyzABCDEF", // WriteDefault 新长度量级
+		strings.Repeat("a", 32),
+	}
+	for _, k := range strong {
+		if isWeakKey(k) {
+			t.Errorf("isWeakKey(%q)=true, want false", k)
+		}
+	}
+}
+
+// TestSecurityCheckNoKeyLeak 守住「拦截文案不回显密钥」：该错误会原样进启动日志，
+// 而被拦下来的恰恰可能是用户在用的真实短密钥——把原文抄进 journald/CI 日志等于
+// 把凭证泄露到凭证之外的地方。只允许出现长度档位。
+func TestSecurityCheckNoKeyLeak(t *testing.T) {
+	const secret = "my-real-secret" // 短于 16 的下限，但确实是真密钥
+	c := Default()
+	c.Listen = "0.0.0.0:7863"
+	c.APIKey = secret
+	_, fatal := c.SecurityCheck()
+	if fatal == nil {
+		t.Fatal("非回环 + 短密钥 应被拦截")
+	}
+	if strings.Contains(fatal.Error(), secret) {
+		t.Errorf("拦截文案泄露了密钥原文: %v", fatal)
+	}
+	if !strings.Contains(fatal.Error(), fmt.Sprint(len(secret))) {
+		t.Errorf("应给出长度档位便于定位: %v", fatal)
+	}
+
+	// 回环监听仍是告警（不阻断），同样不许带原文。
+	c.Listen = "127.0.0.1:7863"
+	warns, fatal := c.SecurityCheck()
+	if fatal != nil || len(warns) == 0 {
+		t.Fatalf("回环应仅告警: fatal=%v warns=%v", fatal, warns)
+	}
+	for _, w := range warns {
+		if strings.Contains(w, secret) {
+			t.Errorf("告警泄露了密钥原文: %v", w)
+		}
 	}
 }
 
@@ -611,7 +674,7 @@ func TestWriteDefault(t *testing.T) {
 	if c.APIKey != key {
 		t.Errorf("api_key=%q want %q", c.APIKey, key)
 	}
-	if c.Listen != ":7863" || c.AuthDir != "./auths" || c.StateFile != "./data/state.json" {
+	if c.Listen != "127.0.0.1:7863" || c.AuthDir != "./auths" || c.StateFile != "./data/state.json" {
 		t.Errorf("generated defaults off: %+v", c)
 	}
 	if len(c.Schedule.CheckinHours) == 0 || !c.Schedule.CheckinEnabled {

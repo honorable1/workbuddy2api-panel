@@ -20,6 +20,14 @@ config.json
 *.tmp
 __pycache__/
 
+# 运行日志（serve.bat / 开机自启写入；含账号 uid 与请求量，不进版本库）
+/logs/
+/server.log
+/build.log
+
+# 编译产物目录（server.exe / server.exe~ / server.new.exe，单个 13MB）
+/bin/
+
 # Backups (contains auth tokens)
 backups/
 

@@ -191,6 +191,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
+	// 各模型剩余可用时间（续航估算 + 限流倒计时）。只读本地池快照与用量账本，
+	// 不打上游，故可被模型页按 5 秒级轮询——见 model_eta.go 的口径说明。
+	p.mux.HandleFunc("GET /panel/api/model_eta", p.withAuth(p.modelEta))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 	p.mux.HandleFunc("GET /panel/api/compensation", p.withAuth(p.compensation))
@@ -274,7 +277,9 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"in_flight_full":  inFlightFull,
 		"accounts":        p.cfg.Pool.List(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
-		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
+		// 与 accounts 的账号池视图互补，前端「模型可用性」表直接渲染。无锁时为 null。
+		// 该表还会叠加 model_eta 的续航列（前端再发一次本地估算请求），这里保留
+		// 纯锁视图是为了在 usage 记录器不可用时仍能退化成原来那张锁池表。
 		"model_locks": p.cfg.Pool.ModelLockView(),
 		// 到期提醒快照的节奏与年龄：界面轮询是 5 秒级，但卡片数据只随余额后台刷新
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。

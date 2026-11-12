@@ -13,6 +13,13 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
+// maxImportAccounts 单次导入的账号条目上限。
+//
+// ParseMultipartForm 只约束文件字节（32MiB），不约束条目数；而每个账号都要串行
+// 打两次上游（CN 签到 + 余额；global 还要注册激活 + trial），一个合法的大文件就能
+// 让请求挂很久并触发上游频控。超出部分按 skipped 明示回报，不静默丢弃。
+const maxImportAccounts = 500
+
 // cockpitAccount 映射 cockpit tools 导出格式的单个账号。
 type cockpitAccount struct {
 	ID            string `json:"id"`
@@ -64,13 +71,18 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
-	if len(accounts) == 0 {
+	total := len(accounts)
+	if total == 0 {
 		writeErr(w, http.StatusBadRequest, "empty accounts array")
 		return
 	}
-
-	var total, imported, skipped int
+	var imported, skipped int
 	var errs []string
+	if total > maxImportAccounts {
+		skipped += total - maxImportAccounts
+		errs = append(errs, fmt.Sprintf("too many accounts (%d), only the first %d were imported", total, maxImportAccounts))
+		accounts = accounts[:maxImportAccounts]
+	}
 
 	for _, acc := range accounts {
 		uid := strings.TrimSpace(acc.UID)
@@ -154,7 +166,6 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 		imported++
 	}
 
-	total = len(accounts)
 	log.Printf("panel: cockpit import finished total=%d imported=%d skipped=%d", total, imported, skipped)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       true,

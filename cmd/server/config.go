@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -269,7 +270,10 @@ type Config struct {
 // Default 默认配置。
 func Default() *Config {
 	c := &Config{
-		Listen:    ":7863",
+		// 默认仅绑定回环地址：fail-safe，避免复制示例/首次自动生成就把网关暴露到
+		// 局域网/公网。需要跨机访问时由用户显式改成 0.0.0.0 并务必设置强 api_key
+		// （见 SecurityCheck 的启动期拦截）。
+		Listen:    "127.0.0.1:7863",
 		APIKey:    "",
 		AuthDir:   "./auths",
 		StateFile: "./data/state.json",
@@ -381,9 +385,11 @@ func ParseConfig(raw []byte) (*Config, error) {
 // WriteDefault 在 path 落一份推荐配置（首次运行自动生成，双击即开免手工复制样例）。
 // 值取自 Default()（含超时/熔断/签到排程等推荐值），api_key 用 crypto/rand 随机生成：
 // 安全默认优于示例占位符（listen 绑定 0.0.0.0，空 key 会把网关裸暴露给局域网）。
-// 返回生成的 key 供启动日志透出。已存在时经 O_EXCL 原子拒绝，绝不改写用户配置。
+// 随机源取 32 字节（256 bit）→ "sk-" + 43 字符；旧的 18 字节（27 字符）仍被判为强密钥，
+// 不影响存量配置。
+// 返回生成的 key 供启动日志透出（日志侧已做掩码）。已存在时经 O_EXCL 原子拒绝，绝不改写用户配置。
 func WriteDefault(path string) (string, error) {
-	raw := make([]byte, 18)
+	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		return "", fmt.Errorf("gen api_key: %w", err)
 	}
@@ -707,6 +713,76 @@ func checkHourRange(field, switchKey string, hours []int) error {
 		}
 	}
 	return nil
+}
+
+// isLoopbackListen 判断监听地址是否仅绑定回环（本机可达）。
+// 空 host（":7863"）、0.0.0.0、具体网卡 IP、[::] 都算暴露（可能跨网段可达），非回环。
+// 仅 127.0.0.1 / localhost / ::1 视为回环安全。
+func isLoopbackListen(listen string) bool {
+	if listen == "" {
+		return false // 视为 :7863，绑定全部接口
+	}
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		// 无端口裸值：normalize 已补 ":" 前缀；仍解析失败则保守按暴露处理。
+		return false
+	}
+	switch host {
+	case "127.0.0.1", "localhost", "::1", "[::1]":
+		return true
+	default:
+		return false
+	}
+}
+
+// isWeakKey 已知弱密钥：空、过短、仓库示例占位符（公开仓库人人皆知），或常见 placeholder。
+//
+// 长度阈值取 16 而不是 32：WriteDefault 早期自动生成的推荐配置是 "sk-" + 24 字符
+// （27 字符），存量部署大量在用——把阈值提到 32 会让这些配置升级后于非回环监听下
+// 直接起不来。16 已足以拦掉 "123456" / "admin" / "a" 这类可暴力枚举的占位符，
+// 随机串不受影响（新生成的密钥已提升到 46 字符，见 WriteDefault）。
+func isWeakKey(key string) bool {
+	if len(key) < 16 {
+		return true
+	}
+	switch {
+	case key == "test_key":
+		return true
+	case strings.HasPrefix(key, "sk-test"),
+		strings.HasPrefix(key, "changeme"),
+		strings.HasPrefix(key, "example"):
+		return true
+	}
+	return false
+}
+
+// SecurityCheck 启动/保存配置时做暴露面自检。
+//
+// 返回：
+//   - warns：非致命告警（仍允许启动），目前仅「回环监听 + 弱密钥」——本机安全，
+//     提醒用户勿在暴露网络前设置强 api_key。
+//   - fatal：致命错误，调用方应拒绝启动/保存——「非回环监听 + 弱密钥」组合下，
+//     任意同网段主机都能白嫖网关并接管管理面板（删号/改配置），必须拦截。
+//
+// 设计取舍：不强行拒绝所有弱密钥（回环下留空便于本机一键起），只拦最危险的
+// 「暴露网络 + 无鉴权/示例密钥」组合；强密钥永远放行。
+func (c *Config) SecurityCheck() (warns []string, fatal error) {
+	if !isWeakKey(c.APIKey) {
+		return nil, nil
+	}
+	if !isLoopbackListen(c.Listen) {
+		// 不回显密钥：此行会原样进启动日志与容器日志，而长度阈值（<16 判弱）意味着
+		// 被拦下来的可能是用户**真实在用的**短密钥——把它打进日志等于把凭证抄进
+		// journald/CI。只说长度档位，够定位问题（"去换个更长的"）而不泄露内容。
+		return nil, fmt.Errorf(
+			"安全拦截：监听地址 %q 暴露在所有网卡，且 api_key 为空、过短（%d 字符，需 ≥16）"+
+				"或为已知弱密钥；在公开/局域网暴露前请设置强 api_key，"+
+				"或将 listen 改为 127.0.0.1:7863（仅本机）",
+			c.Listen, len(c.APIKey))
+	}
+	warns = append(warns, "api_key 为空或仍为示例弱密钥：当前仅监听回环（本机安全），"+
+		"请勿在把它暴露到网络前设置强 api_key")
+	return warns, nil
 }
 
 // splitCSV 逗号分隔 → 去空白、丢空项（WB2A_DNS 用）。

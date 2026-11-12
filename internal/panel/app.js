@@ -13,6 +13,13 @@ let refTimer = null;
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
 let mdLocks = [], mdRecent = [];
+// 续航估算（/model_eta）：键为 "realm:model"，与模型行的 id 同构，直接查表。
+// mdEtaHours 是服务端实际生效的窗口，标注口径时必须用它而不是常量。
+let mdEta = {}, mdEtaHours = 24;
+// mdEtaBalance 是 model_eta 顶层的全池余额汇总（余额/净消耗/速率/续航）。
+// 上游不回模型级扣费时，表格每一行都会显示同一个「≈ 全池续航」，这份汇总就是
+// 那串数字的出处，放在表头一行里说明，免得读者以为是按模型分别算出来的。
+let mdEtaBalance = null;
 let reqFilter = { q: '', outcome: '' };
 let reqEntries = [];
 let usDim = 'account', usCreditDim = 'account', usSort = 'total';
@@ -465,45 +472,81 @@ function renderAccounts(list) {
   }).join('');
 }
 
-// renderModelLocks 模型锁池：哪些模型不能用、锁了几个号、还要锁多久。
-// 后端 model_locks 已按「整池不可用 → 没号可用 → 部分限流」排好序，这里只做展示。
-function renderModelLocks(rows) {
+// renderAvailability 模型可用性表：哪些模型不能用、还能撑多久、锁了几个号。
+//
+// 数据源优先用 model_eta 的 rows —— 它本身就是「窗口内有用量记录 ∪ 当前被限流」
+// 的并集，每条都带 locks 字段（locked/servable/total/unlock_at），所以一张表就能
+// 同时回答「谁不能用了」和「谁快没额度了」。拉不到（usage 记录器不可用或接口
+// 异常）时退回 overview 里的 model_locks，退化成原来那张纯锁池表——比改动前更差
+// 的情况不存在。后端已按「整池不可用 → 没号可用 → 续航升序」排好序，这里不重排。
+function renderAvailability(rows, etaRows) {
   const tb = $('mlBody');
   if (!tb) return;
   const note = $('mlNote');
-  if (!rows || !rows.length) {
-    tb.innerHTML = '<tr><td colspan="8"><div class="empty">当前没有模型级限流 —— 所有模型均可选</div></td></tr>';
+  const list = (Array.isArray(etaRows) && etaRows.length) ? etaRows : (rows || []);
+  if (!list.length) {
+    tb.innerHTML = '<tr><td colspan="9"><div class="empty">近 ' + mdEtaHours +
+      ' 小时没有模型请求，也没有模型级限流；模型目录也还没加载（打开「模型」页刷新一次，之后这里会列出全部已知模型）</div></td></tr>';
     if (note) note.textContent = '';
     return;
   }
-  const STATE = { locked: ['bad', '整池不可用'], starved: ['warn', '没号可用'], partial: ['warn', '部分限流'] };
+  // 限流状态只认 state ∈ {locked, starved}；有锁定但仍有号能服务的是 partial，
+  // 不能报成「不可用」。eta 行在 partial 情况下 state 保持续航口径（ok/idle...），
+  // 所以用 locked>0 兜底判断，两张数据源都能正确归类。
+  const LOCK = { locked: ['bad', '整池不可用'], starved: ['warn', '没号可用'] };
+  const lockTag = r => LOCK[r.state] || ((r.locked || 0) > 0 ? ['warn', '部分限流'] : ['ok', '可用']);
   const left = iso => {
     const ms = parseAPITime(iso);
     return ms ? dur(Math.max(0, Math.round((ms - Date.now()) / 1000))) : '—';
   };
-  tb.innerHTML = rows.map(r => {
-    const st = STATE[r.state] || ['mute', r.state || '—'];
+  tb.innerHTML = list.map(r => {
+    const st = lockTag(r);
     const realm = r.realm === 'global' ? '国际版' : '国内版';
+    // total=0 表示该行只来自用量侧、没有模型级限流记录（ModelLockRow 的 Total
+    // 取参与选号的账号数，不可能为 0）。此时「可选/总数」「锁定账号」都无意义，
+    // 显示 0/0 会被读成「池子是空的」，所以给「—」。
+    const hasLock = (r.total || 0) > 0;
     return '<tr>' +
       '<td>' + esc(r.model) + '</td>' +
       '<td><span class="realm-tag">' + realm + '</span></td>' +
       '<td><span class="tag ' + st[0] + '">' + st[1] + '</span></td>' +
-      '<td class="num">' + (r.servable || 0) + ' / ' + (r.total || 0) + '</td>' +
-      '<td class="num">' + (r.locked || 0) + '</td>' +
+      etaCellOf(r) +
+      '<td class="num">' + (hasLock ? (r.servable || 0) + ' / ' + r.total : '—') + '</td>' +
+      '<td class="num">' + (hasLock ? (r.locked || 0) : '—') + '</td>' +
       '<td class="num">' + left(r.unlock_at || r.fully_unlock_at) + '</td>' +
       '<td class="num">' + left(r.fully_unlock_at) + '</td>' +
       '<td>' + (r.reason ? '<div class="note">' + esc(r.reason) + '</div>' : '—') + '</td>' +
       '</tr>';
   }).join('');
   if (note) {
-    const bad = rows.filter(r => r.state === 'locked' || r.state === 'starved').length;
-    note.textContent = bad ? bad + ' 个模型整池不可用' : rows.length + ' 个模型部分限流';
+    const bad = list.filter(r => r.state === 'locked' || r.state === 'starved').length;
+    const partial = list.filter(r => r.state !== 'locked' && r.state !== 'starved' && (r.locked || 0) > 0).length;
+    // 目录行（idle）只是「知道有这个模型」，不等于有观测。混进计数里会把
+    // 「2 个模型有数据」说成一句假话，所以分开数。
+    const measured = list.filter(r => r.state !== 'idle' && r.state !== 'empty').length;
+    const head = [];
+    if (bad) head.push(bad + ' 个整池不可用');
+    if (partial) head.push(partial + ' 个部分限流');
+    // 全池余额一行：模型级扣费缺失时，这是唯一真实的消耗观测，必须给出来。
+    const b = mdEtaBalance;
+    if (b && b.pool_credits > 0) {
+      const spend = '近 ' + mdEtaHours + ' 时扣 ' + (b.consumed || 0) +
+        (b.earned ? ' / 补 ' + b.earned : '') + '，余额 ' + b.pool_credits;
+      head.push(spend + (b.eta_hours ? '，全池约 ' + fmtEta(Number(b.eta_hours)) : ''));
+    }
+    head.push(measured + ' / ' + list.length + ' 个模型有观测');
+    note.textContent = head.join(' · ');
   }
 }
 
 async function loadOverview(quiet) {
   try {
-    const d = await api('overview');
+    // 续航与限流合并表要 model_eta；它是纯本地估算（不打上游），失败时前端
+    // 退回 overview 自带的 model_locks，表退化成纯锁池，不影响总览其它字段。
+    const [d, eta] = await Promise.all([
+      api('overview'),
+      api('model_eta?hours=24').catch(() => null),
+    ]);
     overviewData = d;
     $('sTotal').textContent = d.total;
     $('sHealthy').textContent = d.healthy;
@@ -525,7 +568,9 @@ async function loadOverview(quiet) {
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
     renderAccounts(d.accounts || []);
-    renderModelLocks(d.model_locks);
+    mdEtaBalance = (eta && eta.balance) || null;
+    if (eta && eta.window_hours) mdEtaHours = Number(eta.window_hours) || mdEtaHours;
+    renderAvailability(d.model_locks, eta && eta.rows);
     // 到期卡片跟随首页统计同步刷新（用同一份响应里的按日批次，不额外发请求）。
     // 2 分钟内的实时明细最新且更全，保留；过期后由 state 快照接管，避免点过一次
     // 「检查」之后卡片永远停在那一刻的旧数据。
@@ -639,22 +684,29 @@ function rateCell(m) {
 
 async function loadModels() {
   const tb = $('mdBody');
-  tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
+  tb.innerHTML = '<tr><td colspan="8"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
     // 探测、模型锁与最近请求都是本地可选增强：任一失败不影响模型目录本身。
     // 可用性标签不额外发推理请求，只用模型锁和最近真实请求结果合成。
-    const [d, pr, st, rm] = await Promise.all([
+    const [d, pr, st, rm, eta] = await Promise.all([
       api('models'),
       api('model_probes').catch(() => ({})),
       api('status').catch(() => ({})),
       api('request_metrics').catch(() => ({})),
+      // 续航是纯本地估算（不打上游），失败不影响模型目录本身。
+      api('model_eta?hours=24').catch(() => null),
     ]);
     mdAll = d.models || [];
     mdProbes = pr.probes || {};
     mdLocks = Array.isArray(st.model_locks) ? st.model_locks : [];
     mdRecent = Array.isArray(rm.recent) ? rm.recent : [];
+    mdEta = {};
+    if (eta && Array.isArray(eta.rows)) {
+      mdEtaHours = Number(eta.window_hours) || 24;
+      for (const r of eta.rows) mdEta[r.realm + ':' + r.model] = r;
+    }
     if (!mdAll.length) {
-      tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>';
+      tb.innerHTML = '<tr><td colspan="8"><div class="empty">上游未返回模型</div></td></tr>';
       $('mdCount').textContent = '';
       $('mdNote').textContent = '上游未返回模型';
       return;
@@ -667,7 +719,7 @@ async function loadModels() {
     renderModels();
   } catch (e) {
     mdAll = [];
-    tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="8"><div class="empty">' + esc(e.message) + '</div></td></tr>';
     $('mdCount').textContent = '';
   }
 }
@@ -790,6 +842,92 @@ function mdAvailabilityTag(m) {
   return ' <span class="tag ' + av.cls + ' md-avail" title="' + esc(av.tip) + '">' + esc(av.label) + '</span>';
 }
 
+// fmtEta 续航时长的人话格式。量级跨度极大（几分钟到数月），固定单位会出现
+// 「1440 时」这种难读的值，按量级切单位才符合「还剩多久」的直觉。
+function fmtEta(hours) {
+  if (!(hours > 0)) return '—';
+  if (hours >= 24 * 365) return '> 1 年';
+  if (hours >= 48) return Math.round(hours / 24) + ' 天';
+  if (hours >= 1) return (Math.round(hours * 10) / 10) + ' 时';
+  return Math.max(1, Math.round(hours * 60)) + ' 分';
+}
+
+// etaCellNone 完全没有数据时的占位：既没请求过，也没被限流过。
+function etaCellNone() {
+  return '<td class="num" title="' + esc('近 ' + mdEtaHours + ' 小时没有该模型的请求，也没有限流记录，无法给出时长') + '"><span style="color:var(--ink-3)">—</span></td>';
+}
+
+// etaCellOf 按 model_eta 的一行渲染「剩余可用」列。模型页与首页可用性表共用
+// 同一个渲染函数——两处各写一份，迟早会出现「一边改了阈值另一边忘改」的漂移。
+//
+// 口径优先级：限流倒计时（上游给的，精确）> 续航估算（按近期速率外推）> 无数据。
+// 两种数不能混成一个——一个是「什么时候能再用」，一个是「还能撑多久」，混排会让
+// 人把估算当承诺。所以限流中的行只显示倒计时，续航数字刻意不显示。
+function etaCellOf(r) {
+  if (!r) return etaCellNone();
+  const burn = Number(r.burn_per_hour || 0);
+  const pool = Number(r.pool_credits || 0);
+  const realm = r.realm === 'global' ? '国际版' : '国内版';
+  const base = '近 ' + mdEtaHours + ' 小时该模型消耗 ' + (burn ? burn.toFixed(1) : '0') + ' 积分/时；' +
+    '可动用余额 ' + pool + '（' + realm + '全部可路由账号合计）';
+  if (r.state === 'locked' || r.state === 'starved') {
+    const ms = parseAPITime(r.unlock_at || r.fully_unlock_at);
+    const left = ms ? dur(Math.max(0, Math.round((ms - Date.now()) / 1000))) : '';
+    const label = r.state === 'locked' ? '限流' : '无号可用';
+    const why = r.state === 'locked' ? '整池被该模型限流' : '没有账号能服务该模型（非模型自身限流）';
+    const tip = why + (left ? '，预计 ' + left + '后恢复' : '') + (r.reason ? '；' + r.reason : '');
+    return '<td class="num" title="' + esc(tip) + '"><span class="tag bad">' + label + (left ? ' ' + left : '') + '</span></td>';
+  }
+  if (r.state === 'free') {
+    return '<td class="num" title="' + esc('窗口内有请求但未扣除积分：限时免费 / 夜间免费 / 上游未计费。免不免费由上游决定，不是余额充足的意思') + '"><span class="tag ok">免费中</span></td>';
+  }
+  // 余额口径：上游不回模型级扣费（usage.credit 恒为 0），降级用账号余额变动流水
+  // 外推全池续航。必须带「≈」——它与模型级估算精度不同，混排会让人当成配额。
+  if (r.state === 'pool') {
+    const pb = Number(r.pool_burn_per_hour || 0);
+    const spent = Number(r.pool_consumed || 0);
+    const earned = Number(r.pool_earned || 0);
+    const tip = '参考值（非模型级）：上游未上报该模型的积分消耗，这里按' +
+      '「近 ' + mdEtaHours + ' 小时账号余额实际扣减 ' + spent + ' 积分' +
+      (earned ? '、补回 ' + earned : '') +
+      '（' + (pb ? pb.toFixed(2) : '0') + ' 积分/时）÷ 可动用余额 ' + pool + '」外推。' +
+      '口径是整个' + realm + '账号池，不是这个模型单独的花费' +
+      (r.expiry_capped ? '；余额会被积分到期清零，届时立即不可用' : '');
+    const style = r.expiry_capped ? ' style="color:var(--warn);font-weight:600"' : ' style="font-weight:600"';
+    return '<td class="num" title="' + esc(tip) + '"><span' + style + '>≈ ' + fmtEta(Number(r.eta_hours || 0)) + '</span></td>';
+  }
+  if (r.state === 'growing') {
+    const spent = Number(r.pool_consumed || 0);
+    const earned = Number(r.pool_earned || 0);
+    const tip = '近 ' + mdEtaHours + ' 小时账号余额扣了 ' + spent + '、补回 ' + earned +
+      '（签到 / 任务奖励），净增 ' + (earned - spent) + '。按当前节奏余额不会被用光，所以不给「还能撑多久」' +
+      '——但这不是「免费」：消耗真实发生了，只是补充更快';
+    return '<td class="num" title="' + esc(tip) + '"><span class="tag ok">余额净增</span></td>';
+  }
+  if (r.state === 'idle') {
+    // 「无请求」比「—」多说了一句话：这行是从模型目录铺出来的，不是没数据。
+    // 目录行只带倍率，没有任何用量事实，所以这里不给任何时长。
+    const rate = r.credit_rate ? '；目录倍率 ' + r.credit_rate : '';
+    return '<td class="num" title="' + esc('近 ' + mdEtaHours + ' 小时没有该模型的请求，也没有限流记录，无法给出时长' + rate) + '"><span style="color:var(--ink-3)">无请求</span></td>';
+  }
+  if (r.state === 'empty') {
+    return '<td class="num" title="' + esc('该域可动用余额已为 0：任何模型都要等兑换/签到补额度后才可用') + '"><span class="tag bad">余额耗尽</span></td>';
+  }
+  if (r.state === 'insufficient') {
+    const tip = base + '；但只有 ' + (r.credit_samples || 0) + ' 条请求带积分观测（共 ' + (r.requests || 0) + ' 条），样本不足以外推';
+    return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ink-3)">样本不足</span></td>';
+  }
+  const tip = '估算：' + base + (r.expiry_capped ? '；余额会被积分到期清零，届时立即不可用' : '') +
+    '。按「只跑这个模型」外推，是容量参考，不是配额到期时间';
+  const style = r.expiry_capped ? ' style="color:var(--warn);font-weight:600"' : ' style="font-weight:600"';
+  return '<td class="num" title="' + esc(tip) + '"><span' + style + '>' + fmtEta(Number(r.eta_hours || 0)) + '</span></td>';
+}
+
+// etaCell 模型表用：模型 id（cn:glm-5.2）与 model_eta 的 key 同构，直接查缓存。
+function etaCell(m) {
+  return etaCellOf(mdEta[m.id]);
+}
+
 // mdRowHtml 单个模型行（纯渲染，便于独立测试）。
 function mdRowHtml(m, pr) {
   const eff = (m.supported_efforts || []).slice();
@@ -806,6 +944,7 @@ function mdRowHtml(m, pr) {
   const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
   return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm"><span class="mid">' + esc(m.id) + '</span>' + mdAvailabilityTag(m) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
     '<td class="num">' + rateCell(m) + '</td>' +
+    etaCell(m) +
     '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
     '<td class="efs" style="white-space:normal">' + effs + '</td>' +
     '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
@@ -816,7 +955,7 @@ function renderModels() {
   const tb = $('mdBody');
   const list = mdSortList(mdAll.filter(m => mdMatch(m)));
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="7"><div class="empty">没有符合当前筛选条件的模型</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="8"><div class="empty">没有符合当前筛选条件的模型</div></td></tr>';
   } else {
     tb.innerHTML = list.map(m => mdRowHtml(m, mdProbeOf(m.id))).join('');
   }

@@ -173,6 +173,54 @@ func (l *Ledger) Read(limit int) []Entry {
 	return out
 }
 
+// Stats 一段时间内的余额变动汇总。Consumed / Earned 都是正数，净消耗 =
+// Consumed - Earned（签到、任务奖励会让净消耗变小，甚至为负）。
+type Stats struct {
+	Consumed int64
+	Earned   int64
+	Count    int
+	Earliest time.Time // 窗口内最早一条变动的时间；零值 = 窗口内无变动
+}
+
+// StatsSince 汇总 from（含）之后的全部变动。
+func (l *Ledger) StatsSince(from time.Time) Stats {
+	return l.StatsSinceBy(from, nil)
+}
+
+// StatsSinceBy 同 StatsSince，但只统计 keep(uid) 为真的账号；keep 为 nil = 不过滤。
+//
+// 为什么需要按 uid 过滤：流水只记 uid 不记域，而「这个域还能撑多久」必须按域的
+// 账号集合重新聚合。让调用方决定归属，避免账本层硬编码 realm 概念。
+//
+// 缺文件 / 全新账本返回零值（Count=0），调用方据此判「没有观测」而不是「消耗为 0」。
+func (l *Ledger) StatsSinceBy(from time.Time, keep func(uid string) bool) Stats {
+	if l == nil {
+		return Stats{}
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var s Stats
+	for i := range l.entries {
+		e := &l.entries[i]
+		if e.Time.Before(from) {
+			continue
+		}
+		if keep != nil && !keep(e.UID) {
+			continue
+		}
+		s.Count++
+		if e.Delta < 0 {
+			s.Consumed -= e.Delta
+		} else {
+			s.Earned += e.Delta
+		}
+		if s.Earliest.IsZero() || e.Time.Before(s.Earliest) {
+			s.Earliest = e.Time
+		}
+	}
+	return s
+}
+
 // write 原子写盘（临时文件 + rename，与 usage.Recorder 同口径）。失败只记日志：
 // 留痕是旁路观测，不能反过来影响余额刷新主流程。
 func (l *Ledger) write(raw []byte) {
